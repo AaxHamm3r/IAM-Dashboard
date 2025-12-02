@@ -26,6 +26,7 @@ inspector = boto3.client('inspector2')
 macie = boto3.client('macie2')
 iam = boto3.client('iam')
 ec2 = boto3.client('ec2')
+cloudwatch = boto3.client('cloudwatch')
 
 # Environment variables
 DYNAMODB_TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'iam-dashboard-scan-results')
@@ -72,6 +73,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "scan_parameters": {...}
     }
     """
+    start_time = datetime.utcnow()
+    scan_start_time = datetime.utcnow()
+    
     try:
         logger.info(f"Received event: {json.dumps(event)}")
         
@@ -106,6 +110,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Validate scanner type
         valid_scanners = ['security-hub', 'guardduty', 'config', 'inspector', 'macie', 'iam', 'ec2', 's3', 'full']
         if scanner_type not in valid_scanners:
+            publish_metric('ScanErrors', 1, {'ScannerType': scanner_type, 'ErrorType': 'InvalidScannerType'})
             return create_response(400, {
                 'error': f'Invalid scanner type. Must be one of: {", ".join(valid_scanners)}'
             })
@@ -116,6 +121,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         try:
             scan_result = execute_scan(scanner_type, region, scan_params, scan_id)
+            scan_duration = (datetime.utcnow() - scan_start_time).total_seconds()
             
             # Ensure scan_result is a dict
             if not isinstance(scan_result, dict):
@@ -148,8 +154,59 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         'low_findings': 0
                     }
             
+            # Publish success metrics
+            publish_metric('ScanSuccess', 1, {'ScannerType': scanner_type, 'Region': region})
+            publish_metric('ScanDuration', scan_duration, {'ScannerType': scanner_type, 'Region': region})
+            
+            # Publish finding counts if available
+            if 'summary' in scan_result:
+                summary = scan_result['summary']
+                if 'total_findings' in summary:
+                    publish_metric('FindingsCount', summary['total_findings'], {
+                        'ScannerType': scanner_type,
+                        'Region': region,
+                        'Severity': 'Total'
+                    })
+            elif scanner_type == 'iam' and 'scan_summary' in scan_result:
+                # For IAM scans, use scan_summary instead of summary
+                total_findings = (
+                    scan_result['scan_summary'].get('critical_findings', 0) +
+                    scan_result['scan_summary'].get('high_findings', 0) +
+                    scan_result['scan_summary'].get('medium_findings', 0) +
+                    scan_result['scan_summary'].get('low_findings', 0)
+                )
+                if total_findings > 0:
+                    publish_metric('FindingsCount', total_findings, {
+                        'ScannerType': scanner_type,
+                        'Region': region,
+                        'Severity': 'Total'
+                    })
+            elif scanner_type == 'full' and 'iam' in scan_result:
+                # For full scans, count findings from IAM
+                iam_summary = scan_result.get('iam', {}).get('scan_summary', {})
+                total_findings = (
+                    iam_summary.get('critical_findings', 0) +
+                    iam_summary.get('high_findings', 0) +
+                    iam_summary.get('medium_findings', 0) +
+                    iam_summary.get('low_findings', 0)
+                )
+                if total_findings > 0:
+                    publish_metric('FindingsCount', total_findings, {
+                        'ScannerType': scanner_type,
+                        'Region': region,
+                        'Severity': 'Total'
+                    })
+            
         except Exception as scan_error:
             logger.error(f"Error executing scan: {str(scan_error)}", exc_info=True)
+            
+            # Publish error metrics
+            publish_metric('ScanErrors', 1, {
+                'ScannerType': scanner_type,
+                'Region': region,
+                'ErrorType': 'ScanExecutionFailed'
+            })
+            
             # For full scan and IAM scan, return a completed response with error info
             if scanner_type == 'full':
                 scan_result = {
@@ -196,9 +253,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         except Exception as storage_error:
             logger.warning(f"Error storing results (non-fatal): {str(storage_error)}")
         
-        # Return response - ALWAYS return 200 for full scan to show results
-        response_status = 200 if scanner_type == 'full' else 200
-        return create_response(response_status, {
+        # Return response - ALWAYS return 200 to show results (even for errors in IAM/full scans)
+        return create_response(200, {
             'scan_id': scan_id,
             'scanner_type': scanner_type,
             'region': region,
