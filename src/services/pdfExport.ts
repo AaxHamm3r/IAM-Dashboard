@@ -97,6 +97,7 @@ function generateReportHTML(data: ScanResultData, title: string): string {
   const date = new Date(data.timestamp).toLocaleString();
   const summary = data.scan_summary || {};
   const findings = extractFindings(data);
+  const reportType = data.scanner_type || 'comprehensive';
   
   // Group findings by severity
   const findingsBySeverity = {
@@ -109,6 +110,74 @@ function generateReportHTML(data: ScanResultData, title: string): string {
       return !['critical', 'high', 'medium', 'low'].includes(sev);
     })
   };
+
+  // Generate template-specific content
+  let executiveSection = '';
+  let threatAnalysisSection = '';
+  let complianceSection = '';
+
+  // Executive Summary specific content
+  if (reportType === 'executive-summary') {
+    const compliancePercentage = (data.results as any)?.executive_metrics?.compliance_percentage || 
+      (data.results as any)?.scan_summary?.compliance_score || 
+      (summary.total_findings === 0 ? 100 : Math.max(0, Math.round(100 - ((summary.critical_findings || 0) * 10 + (summary.high_findings || 0) * 5) / (summary.total_findings || 1) * 100))));
+    
+    complianceSection = `
+    <div class="section" style="background: #f9f9f9; padding: 20px; border-radius: 8px; margin: 20px 0;">
+      <h2 style="margin-top: 0;">Compliance Overview</h2>
+      <div style="text-align: center; margin: 30px 0;">
+        <div style="font-size: 48px; font-weight: bold; color: ${compliancePercentage >= 80 ? '#00ff88' : compliancePercentage >= 60 ? '#ffb000' : '#ff0040'};">
+          ${compliancePercentage}%
+        </div>
+        <p style="font-size: 18px; color: #666; margin-top: 10px;">Overall Compliance Score</p>
+      </div>
+      <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; margin-top: 20px;">
+        <div style="padding: 15px; background: white; border-radius: 5px;">
+          <strong>Total Scans Analyzed:</strong> ${(data.results as any)?.scan_summary?.total_scans || 'N/A'}
+        </div>
+        <div style="padding: 15px; background: white; border-radius: 5px;">
+          <strong>Total Findings:</strong> ${summary.total_findings || summary.critical_findings + summary.high_findings + summary.medium_findings + summary.low_findings || 0}
+        </div>
+      </div>
+    </div>
+    `;
+  }
+
+  // Threat Intelligence specific content
+  if (reportType === 'threat-intelligence') {
+    const threatAnalysis = (data.results as any)?.threat_analysis || {};
+    const threatsByType = (data.results as any)?.threats_by_type || {};
+    
+    threatAnalysisSection = `
+    <div class="section">
+      <h2>Threat Analysis</h2>
+      <div style="background: #fff3cd; padding: 15px; border-left: 4px solid #ffb000; margin: 20px 0;">
+        <p><strong>Total Threats Identified:</strong> ${threatAnalysis.total_threats || findings.length}</p>
+        <p><strong>Critical Threats:</strong> ${threatAnalysis.critical_count || findingsBySeverity.Critical.length}</p>
+        <p><strong>High Severity Threats:</strong> ${threatAnalysis.high_count || findingsBySeverity.High.length}</p>
+        <p><strong>Threat Categories:</strong> ${threatAnalysis.threat_types?.length || Object.keys(threatsByType).length}</p>
+      </div>
+      
+      ${Object.keys(threatsByType).length > 0 ? `
+      <h3 style="margin-top: 30px;">Threats by Category</h3>
+      ${Object.entries(threatsByType).map(([type, threats]: [string, any[]]) => `
+        <div style="margin: 20px 0; padding: 15px; background: #f5f5f5; border-radius: 5px;">
+          <h4 style="margin-top: 0; color: #0066cc;">${type} (${threats.length} threats)</h4>
+          <ul style="margin: 10px 0; padding-left: 20px;">
+            ${threats.slice(0, 5).map((threat: any) => `
+              <li style="margin: 5px 0;">
+                <strong>${threat.resource_name || threat.resource_id || 'Unknown'}:</strong> 
+                ${threat.description || threat.title || 'No description'}
+              </li>
+            `).join('')}
+            ${threats.length > 5 ? `<li style="color: #666; font-style: italic;">... and ${threats.length - 5} more</li>` : ''}
+          </ul>
+        </div>
+      `).join('')}
+      ` : ''}
+    </div>
+    `;
+  }
 
   return `
 <!DOCTYPE html>
@@ -211,7 +280,7 @@ function generateReportHTML(data: ScanResultData, title: string): string {
   </div>
 
   <div class="section">
-    <h2>Executive Summary</h2>
+    <h2>${reportType === 'executive-summary' ? 'Key Metrics' : 'Executive Summary'}</h2>
     <div class="summary-grid">
       <div class="summary-card">
         <h3 class="critical">${summary.critical_findings || 0}</h3>
@@ -232,6 +301,10 @@ function generateReportHTML(data: ScanResultData, title: string): string {
     </div>
   </div>
 
+  ${complianceSection}
+
+  ${threatAnalysisSection}
+
   ${data.scan_summary ? `
   <div class="section">
     <h2>Resource Summary</h2>
@@ -250,7 +323,7 @@ function generateReportHTML(data: ScanResultData, title: string): string {
 
   ${findings.length > 0 ? `
   <div class="section">
-    <h2>Detailed Findings (${findings.length} total)</h2>
+    <h2>${reportType === 'executive-summary' ? 'Top Critical Risks' : reportType === 'threat-intelligence' ? 'Threat Details' : 'Detailed Findings'} (${findings.length} total)</h2>
     ${findingsBySeverity.Critical.length > 0 ? `
     <div class="severity-section" style="margin: 20px 0;">
       <h3 style="color: #ff0040; margin-bottom: 10px;">Critical Findings (${findingsBySeverity.Critical.length})</h3>
